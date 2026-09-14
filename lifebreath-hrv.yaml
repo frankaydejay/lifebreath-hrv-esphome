@@ -1,0 +1,484 @@
+substitutions:
+  device_name: lifebreath-hrv
+  friendly_name: "HRV"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  includes:
+    - hrv_component.h
+  on_boot:
+    priority: -100
+    then:
+      - lambda: global_hrv->setup();
+
+esp32:
+  board: m5stack-atoms3
+  framework:
+    type: arduino
+
+logger:
+  level: INFO
+
+api:
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${device_name} fallback"
+
+captive_portal:
+
+# ══════════════════════════════════════════════════════════════════════════
+#  PERIODIC TASKS
+# ══════════════════════════════════════════════════════════════════════════
+interval:
+  - interval: 100ms
+    then:
+      - lambda: global_hrv->loop();
+
+  # Mirror the HRV's actual state into the UI while Home Assistant is NOT in
+  # control. Note we never read id(...).state: that member no longer exists in
+  # recent ESPHome versions, so we compare against our own mirrors instead.
+  - interval: 1s
+    then:
+      - lambda: |-
+          if (!global_hrv->valid_) return;
+          if (global_hrv->boost_active_) return;            // a boost must not overwrite the setpoint
+          if (global_hrv->ha_has_control() && global_hrv->ha_armed_) return;
+          if (global_hrv->ui_recently_touched()) return;    // grace period after a manual change
+
+          std::string m = global_hrv->mode_option_str();
+          if (global_hrv->ui_mode_ != m) {
+            global_hrv->ui_mode_ = m;
+            global_hrv->select_sync_ = true;                // re-entrancy guard
+            auto c = id(hrv_mode_sel).make_call();
+            c.set_option(m);
+            c.perform();
+            global_hrv->select_sync_ = false;
+          }
+
+          uint8_t v = global_hrv->fan_speed_;
+          if (global_hrv->ui_speed_ != v) {
+            global_hrv->ui_speed_ = v;
+            global_hrv->select_sync_ = true;
+            auto c = id(hrv_speed_num).make_call();
+            c.set_value((float) v);
+            c.perform();
+            global_hrv->select_sync_ = false;
+          }
+
+# ══════════════════════════════════════════════════════════════════════════
+#  CONTROLS
+# ══════════════════════════════════════════════════════════════════════════
+select:
+  - platform: template
+    name: "HRV Target mode"
+    id: hrv_mode_sel
+    icon: mdi:swap-horizontal
+    optimistic: true
+    options:
+      - "Fresh"
+      - "Recirc"
+    initial_option: "Fresh"      # must match ui_mode_ in hrv_component.h
+    on_value:
+      - lambda: |-
+          global_hrv->ui_mode_ = x;               // keep the mirror current
+          if (global_hrv->select_sync_) return;   // internal sync, not a user action
+          global_hrv->apply_ui_command();
+
+  # Mode used during a bathroom timer boost. Persistent across reboots.
+  # restore_value forbids initial_option, so the first-boot default comes from
+  # boost_mode_ in hrv_component.h.
+  - platform: template
+    name: "HRV Boost mode"
+    id: hrv_boost_mode_sel
+    icon: mdi:shower
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    options:
+      - "Fresh"
+      - "Recirc"
+    on_value:
+      - lambda: |-
+          global_hrv->boost_mode_ = (x == "Recirc") ? MODE_RECIRC : MODE_FRESH;
+
+number:
+  - platform: template
+    name: "HRV Target speed"
+    id: hrv_speed_num
+    icon: mdi:fan
+    optimistic: true
+    min_value: 0
+    max_value: 5
+    step: 1
+    initial_value: 0             # must match ui_speed_ in hrv_component.h
+    mode: slider
+    on_value:
+      - lambda: |-
+          global_hrv->ui_speed_ = (uint8_t) x;    // keep the mirror current
+          if (global_hrv->select_sync_) return;
+          global_hrv->apply_ui_command();
+
+  # Speed used during a boost. Deliberately clamped to 1-5: a boost must never
+  # switch the HRV off. First-boot default comes from boost_fan_ in the header.
+  - platform: template
+    name: "HRV Boost speed"
+    id: hrv_boost_speed_num
+    icon: mdi:fan-plus
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    min_value: 1
+    max_value: 5
+    step: 1
+    mode: slider
+    on_value:
+      - lambda: global_hrv->boost_fan_ = (uint8_t) x;
+
+  # Safety cap on boost length (0 = unlimited).
+  # First-boot default comes from boost_max_min_ in the header.
+  - platform: template
+    name: "HRV Boost max duration"
+    id: hrv_boost_max_num
+    icon: mdi:timer-alert-outline
+    entity_category: config
+    unit_of_measurement: "min"
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 180
+    step: 5
+    mode: box
+    on_value:
+      - lambda: global_hrv->boost_max_min_ = (uint16_t) x;
+
+switch:
+  # Main toggle: ON = Home Assistant commands, OFF = wall panel commands
+  - platform: template
+    name: "HRV Home Assistant control"
+    id: hrv_ha_control
+    icon: mdi:account-switch
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF     # boot to wall panel control (safe default)
+    turn_on_action:
+      - lambda: global_hrv->set_source(true);
+    turn_off_action:
+      - lambda: global_hrv->set_source(false);
+
+  # Bathroom timer boost. Outranks both Home Assistant and the wall panel for
+  # as long as the timer signal persists.
+  - platform: template
+    name: "HRV Timer boost enabled"
+    id: hrv_boost_enable
+    icon: mdi:shower-head
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - lambda: global_hrv->set_boost_enabled(true);
+    turn_off_action:
+      - lambda: global_hrv->set_boost_enabled(false);
+
+  # When enabled, touching the wall panel takes control back from HA.
+  - platform: template
+    name: "HRV Wall panel priority"
+    id: hrv_panel_override
+    icon: mdi:gesture-tap-button
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - lambda: global_hrv->set_panel_override(true);
+    turn_off_action:
+      - lambda: global_hrv->set_panel_override(false);
+
+  # ── Diagnostic kill switches ──
+  - platform: template
+    name: "HRV TX to HRV enabled"
+    id: hrv_tx_enable
+    entity_category: diagnostic
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - lambda: global_hrv->set_tx_enabled(true);
+    turn_off_action:
+      - lambda: global_hrv->set_tx_enabled(false);
+
+  - platform: template
+    name: "HRV TX to panel enabled"
+    id: hrv_lcd_tx_enable
+    entity_category: diagnostic
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - lambda: global_hrv->set_lcd_tx_enabled(true);
+    turn_off_action:
+      - lambda: global_hrv->set_lcd_tx_enabled(false);
+
+  - platform: template
+    name: "HRV RX from panel enabled"
+    id: hrv_lcd_rx_enable
+    entity_category: diagnostic
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - lambda: global_hrv->set_lcd_rx_enabled(true);
+    turn_off_action:
+      - lambda: global_hrv->set_lcd_rx_enabled(false);
+
+# ══════════════════════════════════════════════════════════════════════════
+#  STATE & DIAGNOSTICS
+# ══════════════════════════════════════════════════════════════════════════
+text_sensor:
+  - platform: template
+    name: "HRV Mode"
+    id: hrv_mode_txt
+    update_interval: 2s
+    lambda: return {std::string(global_hrv->mode_str())};
+
+  - platform: template
+    name: "HRV State"
+    id: hrv_state_txt
+    icon: mdi:hvac
+    update_interval: 2s
+    lambda: return {global_hrv->state_option_str()};
+
+  - platform: template
+    name: "HRV Control source"
+    icon: mdi:account-switch
+    update_interval: 2s
+    lambda: return {global_hrv->source_str()};
+
+  - platform: template
+    name: "HRV HA setpoint"
+    entity_category: diagnostic
+    update_interval: 2s
+    lambda: return {global_hrv->ha_option_str()};
+
+  - platform: template
+    name: "HRV Panel command"
+    entity_category: diagnostic
+    update_interval: 2s
+    lambda: return {global_hrv->panel_option_str()};
+
+  # ── Bathroom timers + boost ──
+  - platform: template
+    name: "HRV Bathroom timer"
+    icon: mdi:shower
+    update_interval: 2s
+    lambda: return {global_hrv->timer_state_str()};
+
+  - platform: template
+    name: "HRV Boost state"
+    icon: mdi:fan-plus
+    update_interval: 2s
+    lambda: return {global_hrv->boost_state_str()};
+
+  - platform: template
+    name: "HRV Boost setpoint"
+    entity_category: diagnostic
+    update_interval: 5s
+    lambda: return {global_hrv->boost_option_str()};
+
+  - platform: template
+    name: "HRV Timer byte"
+    entity_category: diagnostic
+    update_interval: 2s
+    lambda: return {global_hrv->timer_hex_str()};
+
+  - platform: template
+    name: "HRV Timer values seen"
+    entity_category: diagnostic
+    update_interval: 5s
+    lambda: return {global_hrv->timer_table_str()};
+
+  - platform: template
+    name: "HRV Frame to panel"
+    entity_category: diagnostic
+    update_interval: 5s
+    lambda: return {global_hrv->lcd_frame_hex()};
+
+  - platform: template
+    name: "HRV Raw dump"
+    entity_category: diagnostic
+    update_interval: 5s
+    lambda: return {global_hrv->raw_dump_hex()};
+
+  - platform: template
+    name: "HRV Raw dump timing"
+    entity_category: diagnostic
+    update_interval: 5s
+    lambda: return {global_hrv->raw_dump_timing_str()};
+
+  - platform: template
+    name: "HRV Panel raw dump"
+    entity_category: diagnostic
+    update_interval: 5s
+    lambda: return {global_hrv->raw_dump_hex_lcd()};
+
+  - platform: template
+    name: "HRV Panel raw dump timing"
+    entity_category: diagnostic
+    update_interval: 5s
+    lambda: return {global_hrv->raw_dump_timing_str_lcd()};
+
+sensor:
+  - platform: template
+    name: "HRV Fan speed"
+    id: hrv_fan_num
+    icon: mdi:fan
+    update_interval: 2s
+    accuracy_decimals: 0
+    lambda: return (float) global_hrv->fan_speed_;
+
+  - platform: template
+    name: "HRV Boost duration"
+    icon: mdi:timer-sand
+    unit_of_measurement: "min"
+    accuracy_decimals: 1
+    update_interval: 10s
+    lambda: return global_hrv->boost_elapsed_min();
+
+  # Length of the PREVIOUS boost. Since the three timer durations are
+  # indistinguishable in the signal itself, this reveals afterwards which
+  # timer was pressed (~20 / 40 / 60 min).
+  - platform: template
+    name: "HRV Boost last duration"
+    icon: mdi:history
+    unit_of_measurement: "min"
+    accuracy_decimals: 1
+    update_interval: 10s
+    lambda: return global_hrv->boost_last_min_;
+
+  - platform: template
+    name: "HRV Boost count"
+    entity_category: diagnostic
+    update_interval: 10s
+    accuracy_decimals: 0
+    lambda: return (float) global_hrv->boost_count_;
+
+  - platform: template
+    name: "HRV Timer pulse width"
+    entity_category: diagnostic
+    unit_of_measurement: "ms"
+    accuracy_decimals: 1
+    update_interval: 2s
+    lambda: return global_hrv->timer_pulse_ms();
+
+  - platform: template
+    name: "HRV Timer RX count"
+    entity_category: diagnostic
+    update_interval: 5s
+    accuracy_decimals: 0
+    lambda: return (float) global_hrv->timer_rx_count_;
+
+  - platform: template
+    name: "HRV Timer change count"
+    entity_category: diagnostic
+    update_interval: 5s
+    accuracy_decimals: 0
+    lambda: return (float) global_hrv->timer_change_count_;
+
+  - platform: template
+    name: "HRV Raw byte count"
+    entity_category: diagnostic
+    update_interval: 5s
+    accuracy_decimals: 0
+    lambda: return (float) global_hrv->raw_rx_count_;
+
+  - platform: template
+    name: "HRV Panel raw byte count"
+    entity_category: diagnostic
+    update_interval: 5s
+    accuracy_decimals: 0
+    lambda: return (float) global_hrv->raw_rx_count_lcd_;
+
+  - platform: template
+    name: "HRV TX send count"
+    entity_category: diagnostic
+    update_interval: 5s
+    accuracy_decimals: 0
+    lambda: return (float) global_hrv->tx_send_count_;
+
+  - platform: template
+    name: "HRV Panel cycle count"
+    entity_category: diagnostic
+    update_interval: 5s
+    accuracy_decimals: 0
+    lambda: return (float) global_hrv->lcd_cycle_count();
+
+  - platform: template
+    name: "HRV Panel RX count"
+    entity_category: diagnostic
+    update_interval: 5s
+    accuracy_decimals: 0
+    lambda: return (float) global_hrv->panel_rx_count_;
+
+  - platform: template
+    name: "HRV Frame count"
+    entity_category: diagnostic
+    update_interval: 5s
+    accuracy_decimals: 0
+    lambda: return (float) global_hrv->frame_count_;
+
+binary_sensor:
+  - platform: template
+    name: "HRV Bathroom timer active"
+    icon: mdi:shower-head
+    lambda: return global_hrv->timer_active();
+
+  - platform: template
+    name: "HRV Boost active"
+    icon: mdi:fan-plus
+    lambda: return global_hrv->boost_active_;
+
+  - platform: template
+    name: "HRV Panel TX running"
+    entity_category: diagnostic
+    lambda: return global_hrv->lcd_tx_running();
+
+  # Flags when the wall panel is requesting something other than the HRV's
+  # actual state. Suppressed during a boost, where a mismatch is expected.
+  - platform: template
+    name: "HRV Panel out of sync"
+    icon: mdi:sync-alert
+    lambda: |-
+      if (global_hrv->boost_active_) return false;
+      if (!global_hrv->panel_cmd_valid_ || !global_hrv->valid_) return false;
+      return global_hrv->panel_mode_ != global_hrv->mode_ ||
+             global_hrv->panel_fan_  != global_hrv->fan_speed_;
+
+# ══════════════════════════════════════════════════════════════════════════
+#  SSD1306 OLED DISPLAY
+# ══════════════════════════════════════════════════════════════════════════
+i2c:
+  sda: GPIO38
+  scl: GPIO39
+  scan: true
+
+font:
+  - file: "gfonts://Roboto"
+    id: font_big
+    size: 20
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 12
+
+display:
+  - platform: ssd1306_i2c
+    model: "SSD1306 128x64"
+    address: 0x3C
+    update_interval: 1s
+    lambda: |-
+      it.printf(0,  0, id(font_small), "SRC: %s", global_hrv->source_str().c_str());
+      it.printf(0, 16, id(font_big),   "%s%s", global_hrv->mode_str(),
+                global_hrv->boost_active_ ? " *" : "");
+      it.printf(0, 40, id(font_small), "Speed: %u", global_hrv->fan_speed_);
+      it.printf(0, 52, id(font_small), "%s  T:%s",
+                global_hrv->valid_ ? "OK" : "-- no frame --",
+                global_hrv->timer_state_str().c_str());
